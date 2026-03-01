@@ -1,0 +1,16 @@
+# dataset
+data/raw_videos/
+
+# models
+models/
+*.pt
+
+# cache
+__pycache__/
+*.pyc
+
+# vscode
+.vscode/
+
+# virtual environment
+.venv/
