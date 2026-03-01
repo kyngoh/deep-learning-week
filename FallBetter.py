@@ -1,21 +1,49 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "1"
-
 import cv2
 import math
+import time
+import requests
 from ultralytics import YOLO
 from collections import deque
 
-# ============================================================
-# MULTI-PERSON "ON-GROUND" FALL DETECTION (Front webcam)
-#
-# FALL TRIGGER RULE (your requirement):
-#   Only trigger FALL if person is ON THE GROUND / FLAT
-#   AND holds that position for >= HOLD_SEC (5 seconds).
-#
-# This avoids squatting false positives.
-# ============================================================
+# Load environment variables from the .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+# ----------------
+# TELEGRAM CONFIG (from .env)
+# ----------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_COOLDOWN_SEC = 30           # prevent alert spam
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("[Error] Telegram Bot Token or Chat ID is missing. Exiting.")
+    exit(1)
+
+
+def send_telegram_message(text: str) -> bool:
+    """Send a Telegram message using Bot API."""
+    if not TELEGRAM_BOT_TOKEN or "PASTE_" in TELEGRAM_BOT_TOKEN:
+        print("[Telegram] Bot token not set. Skipping message.")
+        return False
+    if not TELEGRAM_CHAT_ID or "PASTE_" in str(TELEGRAM_CHAT_ID):
+        print("[Telegram] Chat ID not set. Skipping message.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "A fall was detected. Please check immediately."}
+
+    try:
+        r = requests.post(url, json=payload, timeout=8)
+        if r.status_code != 200:
+            print("[Telegram] Failed:", r.status_code, r.text[:200])
+            return False
+        return True
+    except Exception as e:
+        print("[Telegram] Error:", e)
+        return False
+
 
 # ----------------
 # CONFIG
@@ -33,7 +61,6 @@ FLAT_RATIO = 1.35              # bbox width/height > 1.35 indicates lying-ish
 VERY_FLAT_RATIO = 1.55         # extra strong lying signal
 
 # Hip close to ankles (collapsed height)
-# smaller means hips very near ankles (more like floor posture)
 HIP_ANKLE_CLOSE_FRAC = 0.14    # hip_to_ankle < 0.14*h => very low (avoid squat)
 
 # Person is low in the frame (bbox bottom near frame bottom)
@@ -66,6 +93,10 @@ def init_state():
         "fallen": False,
         "upright_frames": 0,
         "last_seen_frame": 0,
+
+        # Telegram anti-spam tracking
+        "alert_sent": False,       # whether we already alerted for current fall episode
+        "last_alert_time": 0.0,    # global-ish per track
     }
 
 # ----------------
@@ -88,11 +119,12 @@ MAX_MISSING_FRAMES = int(MISSING_TIMEOUT_SEC * fps)
 state = {}
 frame_idx = 0
 
-WIN = "Fall Detection (On-ground >= 5s)"
+WIN = "Fall Detection (On-ground >= 5s) + Telegram"
 cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 
 print("Running...")
 print("Rule: FALL only if ON-GROUND/FLAT held >= 5 seconds.")
+print("Telegram: sends alert when FALL first triggers (with cooldown).")
 print("Quit: click window then press Q or ESC.")
 
 # ----------------
@@ -151,6 +183,8 @@ while True:
     else:
         track_ids = list(range(len(kpts_list)))
 
+    now_time = time.time()
+
     n = min(len(track_ids), len(kpts_list), len(boxes_xyxy))
     for idx in range(n):
         tid = int(track_ids[idx])
@@ -201,7 +235,8 @@ while True:
             # decay rather than reset instantly (reduces flicker)
             st["on_ground_frames"] = max(0, st["on_ground_frames"] - 2)
 
-        # Trigger FALL only if held >= 5 seconds
+        # Trigger FALL only if held >= HOLD_SEC
+        was_fallen = st["fallen"]
         if st["on_ground_frames"] >= HOLD_FRAMES:
             st["fallen"] = True
 
@@ -215,6 +250,23 @@ while True:
         if st["fallen"] and st["upright_frames"] >= RESET_FRAMES:
             st["fallen"] = False
             st["on_ground_frames"] = 0
+            st["alert_sent"] = False  # allow new alert next time
+            # do NOT reset last_alert_time (cooldown still applies)
+
+        # ---- TELEGRAM ALERT (edge trigger + cooldown) ----
+        just_fell = (not was_fallen) and st["fallen"]
+        if just_fell and (not st["alert_sent"]):
+            # cooldown check (per-person track)
+            if now_time - st["last_alert_time"] >= TELEGRAM_COOLDOWN_SEC:
+                seconds_down = st["on_ground_frames"] / fps
+                msg = f"🚨 FALL DETECTED (ID:{tid})\nDown for ~{seconds_down:.1f}s.\nPlease check immediately."
+                sent = send_telegram_message(msg)
+                print(f"[Alert] ID:{tid} Telegram sent={sent}")
+                st["last_alert_time"] = now_time
+                st["alert_sent"] = True
+            else:
+                # still mark alert_sent to avoid re-trigger spam during same episode
+                st["alert_sent"] = True
 
         # ---- UI ----
         tx, ty = int(x1), int(max(0, y1 - 10))
