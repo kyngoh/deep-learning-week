@@ -1,4 +1,7 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import cv2
 import math
 import time
@@ -6,20 +9,22 @@ import requests
 from ultralytics import YOLO
 from collections import deque
 
-# Load environment variables from the .env file
-from dotenv import load_dotenv
-load_dotenv()
+# ============================================================
+# MULTI-PERSON "ON-GROUND" FALL DETECTION (Front webcam)
+#
+# FALL TRIGGER RULE (your requirement):
+#   Only trigger FALL if person is ON THE GROUND / FLAT
+#   AND holds that position for >= HOLD_SEC (5 seconds).
+#
+# Adds: Telegram bot alert when FALL triggers
+# ============================================================
 
 # ----------------
-# TELEGRAM CONFIG (from .env)
+# TELEGRAM CONFIG  (EDIT THESE)
 # ----------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = "8540238802:AAHOWCunUixaMP_SdpZsIKwNgMIrCSUxdkE"
+TELEGRAM_CHAT_ID = "365684337"   # e.g. 123456789 or -100xxxxxxxxxx (groups)
 TELEGRAM_COOLDOWN_SEC = 30           # prevent alert spam
-
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print("[Error] Telegram Bot Token or Chat ID is missing. Exiting.")
-    exit(1)
 
 
 def send_telegram_message(text: str) -> bool:
@@ -31,8 +36,8 @@ def send_telegram_message(text: str) -> bool:
         print("[Telegram] Chat ID not set. Skipping message.")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "A fall was detected. Please check immediately."}
+    url = f"https://api.telegram.org/bot8540238802:AAHOWCunUixaMP_SdpZsIKwNgMIrCSUxdkE/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
 
     try:
         r = requests.post(url, json=payload, timeout=8)
