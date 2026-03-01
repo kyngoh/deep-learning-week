@@ -5,54 +5,53 @@ import time
 from ultralytics import YOLO, YOLOWorld
 from collections import deque
 
-# --- Environment Setup ---
+# --- Environment Setup (Mac Specific) ---
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 
 # ============================================================
-# 1) LOAD MODELS (YOLO-World for LVIS-scale & YOLOv8-Pose)
+# 1) LOAD MODELS (YOLO-World & YOLOv8-Pose)
 # ============================================================
 pose_model = YOLO("yolov8n-pose.pt")
 
-# Using YOLO-World fixes the FileNotFoundError for LVIS weights
 try:
     obj_model = YOLOWorld("yolov8s-worldv2.pt")
-    # Define the 'Natural Language' classes to detect
-    VULNERABLE_CLASSES = ["walking stick", "cane", "crutch", "wheelchair", "walker", "dustpan", "broom", "chair", "umbrella", "baseball bat"]
-    obj_model.set_classes(VULNERABLE_CLASSES + ["chair", "umbrella"])
-    USING_WORLD = True
-    print("YOLO-World initialized with LVIS-scale vocabulary.")
+    # Natural Language classes for mobility aids
+    VULNERABLE_CLASSES = [
+        "walking stick", "cane", "crutch", "wheelchair", 
+        "walker", "dustpan", "broom", "chair", "umbrella", "baseball bat"
+    ]
+    obj_model.set_classes(VULNERABLE_CLASSES)
+    print("YOLO-World initialized successfully.")
 except Exception as e:
-    print(f"YOLO-World failed to load: {e}. Falling back to standard COCO.")
+    print(f"YOLO-World failed: {e}. Falling back to standard YOLOv8n.")
     obj_model = YOLO("yolov8n.pt")
-    USING_WORLD = False
 
 # ============================================================
-# 2) CONFIG & CAMERA (Mac-Specific Fix)
+# 2) CONFIG & CAMERA (Mac Fix)
 # ============================================================
-# On Mac, we remove CAP_DSHOW and use default index 0
 cap = cv2.VideoCapture(0) 
 if not cap.isOpened():
-    raise RuntimeError("Camera failed to open. Ensure no other app (Zoom/Teams) is using it.")
+    raise RuntimeError("Camera failed to open. Check Mac Privacy Settings.")
 
 fps = cap.get(cv2.CAP_PROP_FPS)
 if fps is None or fps <= 1:
     fps = 30.0
 
-# Detection Zones
-ZONE_X1, ZONE_X2 = 0.2, 0.8  # Safety zone (middle 60% of road)
-NEAR_FLOOR_FRAC = 0.22       # Bottom 22% of image is the "ground"
+# Detection Zones & Floor Logic
+ZONE_X1, ZONE_X2 = 0.2, 0.8  # Safety zone (middle 60%)
+NEAR_FLOOR_FRAC = 0.30       # Bottom 30% of image is the "ground area"
 
 # Thresholds
-HUNCH_ANGLE_THRESHOLD = 20   # Degrees lean
-GAIT_THRESHOLD = 15          # Pixel movement over 10 frames
-HOLD_SEC = 5.0               # Fall must be held for 5 seconds
+HUNCH_ANGLE_THRESHOLD = 20   # Degrees lean for elderly detection
+GAIT_THRESHOLD = 15          # Pixel movement for slow walking
+HOLD_SEC = 2.5               # Shortened for demo; person must stay down for 2.5s
 HOLD_FRAMES = int(HOLD_SEC * fps)
 
-# Fall Geometry
-TORSO_FLAT_ANGLE = 75
-FLAT_RATIO = 1.35
-HIP_ANKLE_CLOSE_FRAC = 0.16 
+# Fall Geometry Constants
+TORSO_FLAT_ANGLE = 75        # Horizontal torso
+FLAT_RATIO = 1.35            # BBox width/height ratio
+HIP_ANKLE_CLOSE_FRAC = 0.16  # Vertical distance between hip and ankle
 FRAME_WINDOW = 10
 
 # -----------------------------
@@ -74,7 +73,7 @@ def init_person_state():
 
 person_states = {}
 frame_idx = 0
-WIN_NAME = "LTA Smart Guardian Pro (Unified)"
+WIN_NAME = "LTA Smart Guardian Pro"
 cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
 
 # -----------------------------
@@ -89,12 +88,12 @@ while True:
     trigger_extension = False
     floor_y = int((1.0 - NEAR_FLOOR_FRAC) * h)
 
-    # --- STEP A: Object Triggers (YOLO-World) ---
+    # --- STEP A: Object Triggers (Mobility Aids) ---
     obj_results = obj_model.predict(frame, conf=0.25, verbose=False)[0]
     if obj_results.boxes is not None:
         for box in obj_results.boxes:
             label = obj_model.names[int(box.cls[0])]
-            trigger_extension = True # If any set class is detected
+            trigger_extension = True 
             b = box.xyxy[0].cpu().numpy()
             cv2.rectangle(frame, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 255), 2)
             cv2.putText(frame, f"AID: {label}", (int(b[0]), max(0, int(b[1]) - 10)),
@@ -120,7 +119,7 @@ while True:
             st = person_states[tid]
             st["last_seen_frame"] = frame_idx
 
-            # Centers
+            # Centers for analysis
             shoulders = (kpts[5] + kpts[6]) / 2
             hips = (kpts[11] + kpts[12]) / 2
             ankles = (kpts[15] + kpts[16]) / 2
@@ -137,37 +136,35 @@ while True:
                 if avg_angle > HUNCH_ANGLE_THRESHOLD or velocity < GAIT_THRESHOLD:
                     trigger_extension = True
 
-            # 2. Fall Detection Logic
-            ratio = (x2 - x1) / max(1, (y2 - y1))
-            hip_to_ankle = abs(float(ankles[1] - hips[1]))
+            # 2. IMPROVED FALL DETECTION LOGIC
+            bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+            ratio = bw / bh
+            hip_to_ankle_v = abs(float(ankles[1] - hips[1]))
             
-            is_on_ground = (hips[1] >= floor_y) and ((angle > TORSO_FLAT_ANGLE and ratio > FLAT_RATIO) or (hip_to_ankle < HIP_ANKLE_CLOSE_FRAC * h))
-            
-            if is_on_ground:
+            # Checks: horizontal pose OR collapsed height near ground
+            is_flat = (angle > TORSO_FLAT_ANGLE) or (ratio > 1.5)
+            is_collapsed = (hip_to_ankle_v < HIP_ANKLE_CLOSE_FRAC * h)
+            near_ground = (hips[1] >= floor_y) or (ankles[1] >= floor_y) or (y2 >= floor_y)
+
+            if near_ground and (is_flat or is_collapsed):
                 st["on_ground_frames"] += 1
             else:
-                st["on_ground_frames"] = max(0, st["on_ground_frames"] - 2)
+                st["on_ground_frames"] = max(0, st["on_ground_frames"] - 1) # Slower decay for reliability
 
             if st["on_ground_frames"] >= HOLD_FRAMES:
                 st["fallen"] = True
-                trigger_extension = True # Fall in road must hold traffic
+                trigger_extension = True
 
-            # --- UPDATED UI FOR HIGH VISIBILITY ---
+            # --- UI FEEDBACK ---
             if st["fallen"]:
-                # Draw a thick red background box behind the text for maximum contrast
-                cv2.rectangle(frame, (int(x1), int(y1) - 60), (int(x1) + 400, int(y1)), (0, 0, 255), -1)
-                
-                # Large, Bold White Text on Red Background
+                cv2.rectangle(frame, (int(x1), int(y1) - 60), (int(x1) + 350, int(y1)), (0, 0, 255), -1)
                 cv2.putText(frame, "FALLEN", (int(x1) + 10, int(y1) - 15), 
-                            cv2.FONT_HERSHEY_DUPLEX, 2.5, (255, 255, 255), 5)
-                
-                trigger_extension = True # Fall in road must hold traffic
+                            cv2.FONT_HERSHEY_DUPLEX, 2.0, (255, 255, 255), 4)
 
-    # --- STEP C: HUD & DISPLAY ---
-    # Draw Safety Zone
-    cv2.rectangle(frame, (int(ZONE_X1*w), 0), (int(ZONE_X2*w), h), (255, 255, 255), 1)
+    # --- STEP C: SYSTEM HUD ---
+    cv2.rectangle(frame, (int(ZONE_X1*w), 0), (int(ZONE_X2*w), h), (255, 255, 255), 1) # Zone
+    cv2.line(frame, (0, floor_y), (w, floor_y), (0, 255, 255), 1) # Floor Line
     
-    # Status Bar
     status_text = "EXTEND GREEN MAN" if trigger_extension else "NORMAL SIGNAL"
     s_color = (0, 0, 255) if trigger_extension else (0, 255, 0)
     cv2.rectangle(frame, (0, 0), (w, 60), (0, 0, 0), -1)
