@@ -1,4 +1,4 @@
-import os
+\import os
 import csv
 import cv2
 import winsound
@@ -6,6 +6,7 @@ import time
 import numpy as np
 from collections import deque
 from ultralytics import YOLO
+SIREN_WAV = r"C:\Users\trini\Downloads\siren.wav"
 
 # -----------------------------
 # CONFIG (tune these)
@@ -14,18 +15,25 @@ MODEL_YOLO = "yolov8n.pt"
 CONF_THRES = 0.35
 IOU_THRES = 0.45
 
+# Fall rule: horizontal sustained for >= this many seconds
+SUSTAIN_SECONDS = 5.0
+
 # Temporal settings
 WINDOW = 20                 # frames to keep (~0.7s at 30fps)
 DROP_PIXELS_THRES = 25      # sudden downward shift threshold (pixels per frame)
 HORIZONTAL_AR_THRES = 1.25  # width/height > this suggests lying/horizontal
-SUSTAIN_FRAMES = 10         # how many frames horizontal to confirm fall
+SUSTAIN_FRAMES = 10         # will be overwritten automatically from FPS in main()
 ALERT_COOLDOWN = 3.0        # seconds between alerts for same person
+
+# NEW: Alarm “blare” settings
+ALARM_SECONDS = 5.0         # how long to blare
+ALARM_FREQ = 1500           # beep frequency (Hz)
+ALARM_BEEP_MS = 250         # each beep duration (ms)
 
 # Optional Crosswalk ROI (x1, y1, x2, y2) in pixels. Set None to disable.
 CROSSWALK_ROI = None  # e.g. (200, 300, 1100, 900)
 
 # Evidence saving
-
 EVIDENCE_DIR = r"C:\Users\trini\Downloads\falls"  # folder will be created automatically
 SAVE_CROPPED_PERSON = True  # also save the cropped person image
 
@@ -34,10 +42,9 @@ SAVE_CROPPED_PERSON = True  # also save the cropped person image
 # Utility
 # -----------------------------
 def play_alarm():
-    winsound.Beep(1200, 300)
-    winsound.Beep(1200, 300)
-    winsound.Beep(1200, 300)
-
+    end_time = time.time() + ALARM_SECONDS
+    while time.time() < end_time:
+        winsound.PlaySound(SIREN_WAV, winsound.SND_FILENAME)
 
 def box_in_roi(box, roi):
     if roi is None:
@@ -182,8 +189,9 @@ class FallState:
 
         sustained_horizontal = self.horizontal_count >= SUSTAIN_FRAMES
 
-        # Trigger: sudden drop + sustained horizontal posture
-        fall_now = drop_flag and sustained_horizontal
+        # Fall rule: sustained horizontal for >= SUSTAIN_SECONDS
+        fall_now = sustained_horizontal
+
         return drop_flag, horizontal_flag, sustained_horizontal, fall_now
 
 
@@ -198,6 +206,15 @@ def main(video_source=0):
     cap = cv2.VideoCapture(video_source)
     if not cap.isOpened():
         raise RuntimeError("Could not open camera/video source")
+
+    # convert sustain seconds -> frames using FPS
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 1:
+        fps = 30.0  # fallback for webcams that report 0
+
+    global SUSTAIN_FRAMES
+    SUSTAIN_FRAMES = int(fps * SUSTAIN_SECONDS)
+    print(f"[INFO] FPS={fps:.2f}, SUSTAIN_FRAMES={SUSTAIN_FRAMES} (for {SUSTAIN_SECONDS}s)")
 
     # ----- Evidence saving setup -----
     os.makedirs(EVIDENCE_DIR, exist_ok=True)
@@ -284,6 +301,8 @@ def main(video_source=0):
                     ts_file = time.strftime("%Y%m%d_%H%M%S")
 
                     print(f"[{ts}] [ALERT] Fall-like event: ID={pid}, box={box}")
+
+                    # BLARE alarm
                     play_alarm()
 
                     # Save evidence image (full frame with boxes/tags)
